@@ -462,8 +462,16 @@ frontends:
 # per-option keys: `strategies` (allowlist — absent = every serving strategy),
 # `companion` ({ label, description?, command } — helper process rendered as
 # an extra command tab while the option is active), `install` (extra pip dep,
-# shown on the companion tab), `brands` (hardware-brand allowlist), `env`
-# (extra serve env while active), `docs_url`, and `requires_opt_in` (true =
+# shown in the extra-install block above vllm serve and, when present, on the
+# companion tab), `brands` (hardware-brand allowlist), `hardware` (map in the
+# variant-`tp` keyspace — exact id > generation > brand — where `unsupported`
+# opts specific hardware out within an allowed brand), `hardware_overrides`
+# (same keyspace; replaces any top-level key and merges env for that
+# hardware), `setup` (shell lines run after the env exports and right before
+# vllm serve), `docker: false` (no published image carries the option, so the
+# Docker path is hidden while it's active), `env`
+# (extra serve env while active; `env` values and `setup` may use
+# `{tp_size}`), `docs_url`, and `requires_opt_in` (true =
 # fail-CLOSED: disabled until the recipe lists the option as `verified`
 # under `kv_offload_support`).
 
@@ -563,3 +571,62 @@ kv_offload:
           --eviction-ratio 0.10 \
           --eviction-policy LRU \
           --supported-transfer-mode lmcache_driven
+  # IAXL KVShrink always runs on the Intel Xeon host: the Xeon serving vLLM on
+  # CPU, or the host CPU of a GPU server. The selected hardware picks the
+  # platform build via `hardware_overrides` (cpu generation = Xeon CPU
+  # inference, nvidia brand = NVIDIA GPU inference). Grace-based NVIDIA nodes
+  # (Arm hosts without QAT/DSA) are opted out. single_node_tp only: setvars.sh
+  # pins per-rank resources on one node. No PyPI wheel or published vLLM
+  # image includes IAXL yet, so the install is an editable
+  # --no-build-isolation source build
+  # (the native extension builds against the installed torch and loads its
+  # QPL/QAT libs from the source tree; setup.py reads IAXL_VERSION from
+  # setvars.sh, sourced in a subshell) and the Docker path is turned off.
+  # `env` + `setup` render as: export DEVICE/TP_SIZE/switches → source
+  # setvars.sh → vllm serve, so setvars.sh sizes QAT/DSA/CPU per rank for the
+  # TP the engine actually runs with.
+  iaxl:
+    display_name: "IAXL KVShrink"
+    label: "IAXL"
+    order: 5
+    requires_opt_in: true
+    brands:
+      - Intel
+      - NVIDIA
+    hardware:
+      gb200: unsupported
+      gb300: unsupported
+      dgx_station_gb300: unsupported
+      dgx_spark_gb10: unsupported
+    strategies:
+      - single_node_tp
+    docker: false
+    description: "intel-accel-for-llm's KVShrinkConnector offloads KV cache to a compressed host-DRAM store on the Intel Xeon host: Intel QAT/IAA compress and decompress the KV blocks. Prefix caching is turned off so prefix hits come from KVShrink."
+    docs_url: "https://github.com/intel/intel-accel-for-llm#kvshrink-vllm-example"
+    env:
+      TP_SIZE: "{tp_size}"
+      IAXL_DDR_POOL_SIZE_GB: "16"
+    # Run in the intel-accel-for-llm checkout the install step leaves you in.
+    setup: |
+      # From the intel-accel-for-llm checkout: pins per-rank accelerator and CPU resources for TP_SIZE
+      source setvars.sh
+    args:
+      - "--kv-transfer-config"
+      - '{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}'
+      - "--no-enable-prefix-caching"
+    hardware_overrides:
+      # vLLM CPU inference on the Xeon itself. A DEVICE=cpu build has no DSA
+      # or GDRCopy path; QAT/IAA do the compression.
+      cpu:
+        description: "intel-accel-for-llm's KVShrinkConnector offloads KV cache to a compressed DRAM store on this Xeon, beside vLLM CPU inference: Intel QAT/IAA compress and decompress the KV blocks (a DEVICE=cpu build has no DSA path). Prefix caching is turned off so prefix hits come from KVShrink. Needs the in-tree QAT driver with qatlib (IAXL_QATLIB=intree). setvars.sh binds vLLM and IAXL to the same CPUs by default; for best performance export disjoint per-rank CPU lists on one NUMA node (VLLM_CPU_OMP_THREADS_BIND / KVSHRINK_CPU_OMP_THREADS_BIND) before sourcing it — see the CPU inference guide."
+        docs_url: "https://github.com/intel/intel-accel-for-llm/blob/main/doc/usage/vllm-cpu-inference.en.md"
+        install: 'git clone https://github.com/intel/intel-accel-for-llm.git && cd intel-accel-for-llm && uv pip install -r requirements.txt && IAXL_VERSION=$(export DEVICE=cpu; source setvars.sh >/dev/null 2>&1; echo "$IAXL_VERSION") DEVICE=cpu IAXL_QATLIB=intree uv pip install --no-build-isolation -e .'
+        env:
+          DEVICE: "cpu"
+      # NVIDIA GPU inference; IAXL runs on the server's Xeon host.
+      nvidia:
+        description: "intel-accel-for-llm's KVShrinkConnector offloads KV cache to a compressed host-DRAM store on the GPU server's Intel Xeon host (4th Gen Xeon Scalable or later) — not Grace-based nodes. Intel DSA moves KV fragments between GPU memory and host DRAM through GDRCopy (IAXL_DSA_GD_ENABLE) without using GPU SMs or CPU cores, and Intel QAT/IAA compress and decompress them; set IAXL_DSA_GD_ENABLE=0 on GPUs without P2P DMA support. Prefix caching is turned off so prefix hits come from KVShrink. Needs the CUDA toolkit, NIXL (NIXL_INCLUDE_DIR / NIXL_LIB_DIR), the GDRCopy driver (tools/install_gdr_driver.sh), DSA work queues (tools/setup_dsa_cnt.sh) and the in-tree QAT driver with qatlib."
+        install: 'git clone https://github.com/intel/intel-accel-for-llm.git && cd intel-accel-for-llm && uv pip install -r requirements.txt && IAXL_VERSION=$(export DEVICE=cuda; source setvars.sh >/dev/null 2>&1; echo "$IAXL_VERSION") DEVICE=cuda IAXL_QATLIB=intree uv pip install --no-build-isolation -e .'
+        env:
+          DEVICE: "cuda"
+          IAXL_DSA_GD_ENABLE: "1"

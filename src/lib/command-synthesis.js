@@ -500,11 +500,30 @@ export function isKvOffloadSupportedForRecipe(option, optionKey, recipe) {
   return option.requires_opt_in ? support === "verified" : true;
 }
 
-/** Hardware gate: option `brands` allowlist; absent = every brand. */
-export function isKvOffloadBrandSupported(option, hwProfile) {
+/**
+ * Hardware gate: option `brands` allowlist (absent = every brand), then an
+ * optional `hardware` map in the variant-`tp` keyspace (exact id > generation
+ * > brand > `default`) where `unsupported` opts specific hardware out — e.g.
+ * an option that needs an x86 Xeon host excluding Grace-based NVIDIA nodes.
+ */
+export function isKvOffloadBrandSupported(option, hwProfile, hwProfileId = null) {
   const allow = option?.brands;
-  if (!Array.isArray(allow) || allow.length === 0) return true;
-  return allow.includes(hwProfile?.brand);
+  if (Array.isArray(allow) && allow.length > 0 && !allow.includes(hwProfile?.brand)) return false;
+  return hardwareKeyedValue(option?.hardware, hwProfile, hwProfileId) !== "unsupported";
+}
+
+/**
+ * The option as it applies to one hardware: `hardware_overrides` (variant-`tp`
+ * keyspace — exact id > generation > brand > `default`) replaces any top-level
+ * key (`install`, `args`, `description`, `setup`, `docs_url`, …) and merges
+ * into `env`. Lets one option carry per-platform builds (e.g. IAXL's CPU vs
+ * CUDA extension) on one pill.
+ */
+export function resolveKvOffloadOption(option, hwProfile, hwProfileId = null) {
+  const ov = option && hardwareKeyedValue(option.hardware_overrides, hwProfile, hwProfileId);
+  if (!ov) return option;
+  const { env, ...rest } = ov;
+  return { ...option, ...rest, ...(env ? { env: { ...(option.env || {}), ...env } } : {}) };
 }
 
 /**
@@ -1311,8 +1330,8 @@ function resolveCommandImpl(dcpOut, recipe, variantKey, strategyName, hwProfileI
   const kvOpt = kvOptRaw
     && isKvOffloadAllowedForStrategy(kvOptRaw, strategyName, strategy)
     && isKvOffloadSupportedForRecipe(kvOptRaw, kvOffload, recipe)
-    && isKvOffloadBrandSupported(kvOptRaw, hwProfile)
-    ? kvOptRaw
+    && isKvOffloadBrandSupported(kvOptRaw, hwProfile, hwProfileId)
+    ? resolveKvOffloadOption(kvOptRaw, hwProfile, hwProfileId)
     : null;
 
   // kv composition only: instance count + which instance's command is being
@@ -2309,11 +2328,21 @@ function resolveCommandImpl(dcpOut, recipe, variantKey, strategyName, hwProfileI
         .trimEnd(),
     });
   }
+  // The composing option's `env` values and `setup` lines may name the TP size
+  // the engine actually runs with (`{tp_size}`), e.g. a host-side launcher that
+  // sizes per-rank resources before `vllm serve` starts.
+  const env = buildEnv(null);
+  const fillKv = (s) => String(s)
+    .replace(/\{tp_size\}/g, String(lastFlagValue(singleArgs, "--tensor-parallel-size") || 1));
+  for (const k of Object.keys(kvOpt?.env || {})) {
+    if (typeof env[k] === "string") env[k] = fillKv(env[k]);
+  }
   return {
     deployType,
     command: formatCommand(singleArgs),
     argv: formatArgv(singleArgs),
-    env: buildEnv(null),
+    env,
+    ...(kvOpt?.setup ? { setup: fillKv(kvOpt.setup).trimEnd() } : {}),
     ...(companions.length ? { companions } : {}),
   };
 }
